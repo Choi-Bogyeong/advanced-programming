@@ -7,9 +7,9 @@ export declare class AuthService {
     private readonly jwtService;
     constructor(userService: UserService, jwtService: JwtService);
     validateUser(userId: string, password: string): Promise<{
+        id: number;
         userId: string;
         password: string;
-        id: number;
         tokenFreeLogin: boolean;
         createdAt: Date;
     } | null>;
@@ -17,9 +17,9 @@ export declare class AuthService {
         access_token: string;
     }>;
     signup(dto: CreateUserDto): Promise<{
+        id: number;
         userId: string;
         password: string;
-        id: number;
         tokenFreeLogin: boolean;
         createdAt: Date;
     }>;
