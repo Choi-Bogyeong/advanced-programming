@@ -22,14 +22,14 @@ let UserService = class UserService {
             data: {
                 userId: createUserDto.userId,
                 password: createUserDto.password,
-                tokenFreeLogin: true,
             },
         });
     }
     async findOne(userId) {
         const user = await this.prisma.user.findUnique({ where: { userId } });
-        if (!user)
-            throw new common_1.NotFoundException(`User with ID ${userId} not found`);
+        if (!user) {
+            throw new common_1.NotFoundException('해당 사용자를 찾을 수 없습니다.');
+        }
         return user;
     }
     async findAll() {
