@@ -23,7 +23,7 @@ let AiPlannerService = class AiPlannerService {
         this.prisma = prisma;
         this.llmClient = llmClient;
     }
-    async generateStudyPlan(userId, databaseId) {
+    async generateStudyPlanAndSave(userId, databaseId) {
         const user = await this.prisma.user.findUnique({
             where: { userId },
             include: {
@@ -47,15 +47,81 @@ let AiPlannerService = class AiPlannerService {
             console.error('[❌ JSON 파싱 실패]', llmRawResponse);
             throw new common_1.InternalServerErrorException('LLM 응답 JSON 파싱 실패');
         }
-        const resultWithMeta = parsed.map(plan => ({
+        await this.saveStudyPlans(parsed.map(plan => ({
             userId,
             subject: plan.subject,
             startDate: plan.startDate,
             endDate: plan.endDate,
             dailyPlan: plan.dailyPlan,
             databaseId,
-        }));
-        return resultWithMeta;
+        })));
+        return parsed;
+    }
+    async saveStudyPlans(parsedPlans) {
+        for (const plan of parsedPlans) {
+            const { userId: userCode, subject, startDate, endDate, dailyPlan, databaseId } = plan;
+            const user = await this.prisma.user.findUnique({
+                where: { userId: userCode },
+            });
+            if (!user) {
+                throw new Error(`User with userId ${userCode} not found`);
+            }
+            await this.prisma.$transaction(async (prisma) => {
+                const createdStudyPlan = await prisma.studyPlan.create({
+                    data: {
+                        userId: user.id,
+                        subject,
+                        startDate: new Date(startDate),
+                        endDate: new Date(endDate),
+                        databaseId,
+                    },
+                });
+                for (const dayPlan of dailyPlan) {
+                    if (!dayPlan.includes(':')) {
+                        throw new Error(`Invalid dailyPlan format: ${dayPlan}`);
+                    }
+                    const [dateStr, ...contentParts] = dayPlan.split(':');
+                    const content = contentParts.join(':').trim();
+                    const [month, day] = dateStr.split('/').map(Number);
+                    const year = new Date(startDate).getFullYear();
+                    const date = new Date(year, month - 1, day);
+                    await prisma.dailyPlan.create({
+                        data: {
+                            date,
+                            content,
+                            studyPlanId: createdStudyPlan.id,
+                        },
+                    });
+                    console.log(`✅ 저장된 DailyPlan: ${date.toISOString()} - ${content}`);
+                }
+            });
+        }
+        console.log('✅ 모든 StudyPlan과 DailyPlan 저장 완료');
+    }
+    async getStudyPlansByUserId(userId) {
+        const user = await this.prisma.user.findUnique({
+            where: { userId },
+            select: { id: true },
+        });
+        if (!user) {
+            throw new Error(`User with userId ${userId} not found`);
+        }
+        const studyPlans = await this.prisma.studyPlan.findMany({
+            where: {
+                userId: user.id,
+            },
+            include: {
+                dailyPlans: {
+                    orderBy: {
+                        date: 'asc',
+                    },
+                },
+            },
+            orderBy: {
+                startDate: 'asc',
+            },
+        });
+        return studyPlans;
     }
     createPromptFromUserData(user) {
         const { preference, exams } = user;
@@ -76,60 +142,56 @@ let AiPlannerService = class AiPlannerService {
         });
         const dateHint = Array.from(new Set(allValidDates)).sort().join(', ');
         return `
-  너는 AI 기반 학습 스케줄러야. 사용자 선호도와 시험 정보를 기반으로 과목별 학습 계획(dailyPlan)을 작성해.
+너는 AI 기반 학습 스케줄러야. 사용자 선호도와 시험 정보를 기반으로 과목별 학습 계획(dailyPlan)을 작성해.
 
-  📌 사용자 선호도:
-  - 학습 스타일: ${style}  // focus 또는 multi
-  - 학습 요일: ${studyDays.join(', ')}  // 예: 월,화,수,목
-  - 하루 세션 수: ${sessions}
+📌 사용자 선호도:
+- 학습 스타일: ${style}  // focus 또는 multi
+- 학습 요일: ${studyDays.join(', ')}  // 예: 월,화,수,목
+- 하루 세션 수: ${sessions}
 
-  📌 시험 정보:
-  ${examStr}
+📌 시험 정보:
+${examStr}
 
-  📌 가능한 학습 날짜 목록:
-  [${dateHint}]
-  ※ 반드시 이 날짜들만 사용할 것. 이외 날짜는 절대 사용하지 마.
+📌 가능한 학습 날짜 목록:
+[${dateHint}]
+※ 반드시 이 날짜들만 사용할 것. 이외 날짜는 절대 사용하지 마.
 
-  📌 출력 형식:
-  [
-    {
-      "userId": "a",
-      "subject": "과목명",
-      "startDate": "YYYY-MM-DD",
-      "endDate": "YYYY-MM-DD",
-      "dailyPlan": [
-        "6/1: Chapter 1 (p.1-25)",
-        "6/3: Chapter 2 (p.1-30)",
-        "6/5: Review"
-      ],
-      "databaseId": "abc123"
-    }
-  ]
+📌 출력 형식:
+[
+  {
+    "userId": "${user.userId}",
+    "subject": "과목명",
+    "startDate": "YYYY-MM-DD",
+    "endDate": "YYYY-MM-DD",
+    "dailyPlan": [
+      "6/1: Chapter 1 (p.1-25)",
+      "6/3: Chapter 2 (p.1-30)",
+      "6/5: Review"
+    ],
+    "databaseId": "abc123"
+  }
+]
 
-  📌 반드시 지켜야 할 조건:
+📌 반드시 지켜야 할 조건:
 
-  1. 모든 과목의 **모든 챕터는 contentVolume 전체 분량을 빠짐없이 학습**해야 한다.
-    - 일부만 학습하고 넘어가는 경우는 절대 허용되지 않는다.
-    - 마지막 챕터의 마지막 페이지까지 반드시 포함되어야 한다.
-  2. 하나의 과목 내에서는 챕터 순서를 반드시 지켜야 하며, 이전 챕터를 완전히 학습한 후에만 다음 챕터로 넘어갈 수 있다.
-  3. 하루에 같은 챕터를 나눠 학습하는 건 가능하지만, 하나의 줄로 병합해 출력한다.
-    - 예: "6/3: Chapter 2 (p.1-30)" ← O
-    - 예: "6/3: Chapter 2 (p.1-10)", "6/3: Chapter 2 (p.11-20)" ← X
-  4. 하루에 배정되는 챕터 수는 ${sessions}개 이하여야 한다.
-  5. 각 챕터는 difficulty에 따라 다음과 같이 분할되어야 한다:
-    - 쉬움: 하루 최대 25p
-    - 보통: 하루 최대 17p
-    - 어려움: 하루 최대 12p
-  6. 학습 스타일에 따라 다음을 따른다:
-    - focus: 하루에 한 과목만 학습
-    - multi: 하루에 여러 과목을 병행 
-  7. dailyPlan은 studyDays에 해당하는 요일만 포함해야 한다. 예: ["월", "화", "수"]면 금/토/일은 제외한다.
-  8. Review는 **모든 챕터가 완전히 끝난 이후**에만 배정한다. 하나라도 챕터가 누락되었으면 Review는 배정하지 않는다.
-  9. 하루 학습량은 현실적인 분량을 넘지 않도록 하고, 일정은 날짜 순으로 정렬되어야 한다.
-  10. 절대로 누락된 챕터가 있으면 안 되며, 마지막 챕터의 마지막 페이지까지 포함되어야 한다.
+1. 모든 과목의 **모든 챕터는 contentVolume 전체 분량을 빠짐없이 학습**해야 한다.
+2. 하나의 과목 내에서는 챕터 순서를 반드시 지켜야 하며, 이전 챕터를 완전히 학습한 후에만 다음 챕터로 넘어갈 수 있다.
+3. 하루에 같은 챕터를 나눠 학습하는 건 가능하지만, 하나의 줄로 병합해 출력한다.
+4. 하루에 배정되는 챕터 수는 ${sessions}개 이하여야 한다.
+5. 각 챕터는 difficulty에 따라 다음과 같이 분할되어야 한다:
+   - 쉬움: 하루 최대 25p
+   - 보통: 하루 최대 17p
+   - 어려움: 하루 최대 12p
+6. 학습 스타일에 따라 다음을 따른다:
+   - focus: 하루에 한 과목만 학습
+   - multi: 하루에 여러 과목을 병행 
+7. dailyPlan은 studyDays에 해당하는 요일만 포함해야 한다.
+8. Review는 **모든 챕터가 완전히 끝난 이후**에만 배정한다.
+9. 하루 학습량은 현실적인 분량을 넘지 않도록 하고, 일정은 날짜 순으로 정렬되어야 한다.
+10. 절대로 누락된 챕터가 있으면 안 되며, 마지막 챕터의 마지막 페이지까지 포함되어야 한다.
 
-  📌 출력은 반드시 JSON 배열만 포함해야 하며, 설명 문장이나 코드 블록은 절대 포함하지 않는다.
-  `.trim();
+📌 출력은 반드시 JSON 배열만 포함해야 하며, 설명 문장이나 코드 블록은 절대 포함하지 않는다.
+`.trim();
     }
 };
 exports.AiPlannerService = AiPlannerService;
